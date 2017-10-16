@@ -1,12 +1,14 @@
 #lang curly-fn racket/base
 
-(require racket/require hackett/private/util/require)
+(require racket/provide racket/require hackett/private/util/require)
 
-(require (for-syntax (multi-in racket [base contract list match syntax])
+(require (for-syntax (multi-in racket [base contract list match provide-transform require-transform
+                                       syntax])
                      syntax/parse/experimental/template
                      threading)
          (postfix-in - (combine-in racket/base
                                    racket/promise
+                                   racket/splicing
                                    syntax/id-table))
          racket/stxparam
          syntax/parse/define
@@ -19,10 +21,10 @@
 (provide (for-syntax (all-from-out hackett/private/typecheck)
                      τs⇔/λ! τ⇔/λ! τ⇔! τ⇐/λ! τ⇐! τ⇒/λ! τ⇒! τ⇒app! τs⇒!)
          #%module-begin #%top
-         (rename-out [#%plain-module-begin @%module-begin]
-                     [#%top @%top]
+         (rename-out [#%top @%top]
                      [∀ forall])
-         @%datum @%app @%superclasses-key @%dictionary-placeholder @%with-dictionary
+         @%module-begin @%datum @%app @%superclasses-key @%dictionary-placeholder @%with-dictionary
+         submodule-part type-out only-types-in unmangle-types-in
          define-primop define-base-type
          -> ∀ => Integer Double String
          : λ1 def let letrec)
@@ -332,6 +334,137 @@
                      constrs)))])
        dict-expr)])
 
+;; ---------------------------------------------------------------------------------------------------
+
+(define-syntax-parameter current-lifted-submodule-parts #f)
+
+(begin-for-syntax
+  (define/contract (lift-submodule-part! submod-name stx)
+    (-> symbol? syntax? void?)
+    (unless (syntax-parameter-value #'current-lifted-submodule-parts)
+      (error 'lift-submodule-part!
+             "not currently transforming in a context that supports lifting submodule parts"))
+    (hash-update! (syntax-parameter-value #'current-lifted-submodule-parts)
+                  submod-name #{cons (syntax-local-introduce stx) %} '()))
+
+  (define (submodule-parts->submodules)
+    (let ([all-parts (syntax-parameter-value #'current-lifted-submodule-parts)])
+      (for/list ([(name parts) (in-hash all-parts)])
+        (let ([parts* (map syntax-local-introduce (reverse parts))])
+          (println parts*)
+          (println (identifier-binding (datum->syntax (syntax-local-introduce (first parts*)) '#%module-begin)))
+          (datum->syntax (first parts*)
+                         (list* #'module* name #f parts*)
+                         (first parts*)))))))
+
+(define-syntax-parser @%module-begin
+  [(_ form ...)
+   #:do [(displayln "----------------------> @%module-begin")]
+   #'(#%plain-module-begin (@%module-begin* form ...))])
+
+(define-syntax-parser @%module-begin*
+  [(_ form ...)
+   #:do [(displayln "----------------------> @%module-begin*")]
+   #:with [body-form ...] #'((begin/value-namespace form ...)
+                             (lifted-submodules))
+   ; Don’t create new value/type namespaces if they already exist (which might happen if we’re in a
+   ; module* submodule with #f for the module path).
+   #:do [(println (syntax->datum #'[body-form ...]))
+         (println (not (not (syntax-parameter-value #'current-value-introducer))))]
+   (if (syntax-parameter-value #'current-value-introducer)
+       #'(splicing-syntax-parameterize-
+             ([current-lifted-submodule-parts (make-hasheq)])
+           body-form ...)
+       #'(splicing-syntax-parameterize-
+             ([current-value-introducer (make-syntax-introducer #t)]
+              [current-type-introducer (make-syntax-introducer #t)]
+              [current-lifted-submodule-parts (make-hasheq)])
+           body-form ...))])
+
+(define-syntax-parser lifted-submodules
+  [(_)
+   #:with [submod-decl ...] (submodule-parts->submodules)
+   #:do [(println (syntax->datum #'[submod-decl ...]))]
+   #'(begin- submod-decl ...)])
+
+#;(define-syntax-parser inner-module-begin/capture-submodule-parts
+  [(_ form ...)
+   #:do [(println (syntax-local-context))]
+   #:with expanded (local-expand #'(begin/value-namespace form ...) 'module '())
+   #:with [submod-decl ...] (submodule-parts->submodules)
+   #'(begin expanded (begin/value-namespace submod-decl ...))])
+
+(define-syntax-parser submodule-part
+  [(_ name:id body ...)
+   #:fail-unless (eq? (syntax-local-context) 'module) "not at module top level"
+   #:do [(for ([body (in-list (attribute body))])
+           (lift-submodule-part! (syntax-e #'name) body))]
+   #'(begin-)])
+
+(define-syntax-parser begin/value-namespace
+  [(_ form ...)
+   (value-namespace-introduce
+    (syntax/loc this-syntax
+      (begin form ...)))])
+
+(define-syntax-parser begin/type-namespace
+  [(_ form ...)
+   (type-namespace-introduce
+    (syntax/loc this-syntax
+      (begin form ...)))])
+
+(begin-for-syntax
+  (define (mangle-type-name name)
+    (string-append "#%hackett-type:" name))
+
+  (define mangled-type-regexp #rx"^#%hackett-type:(.+)$")
+  (define (unmangle-type-name name)
+    (and~> (regexp-match mangled-type-regexp name) second))
+  (define (unmangle-value-name name)
+    (and (not (regexp-match? mangled-type-regexp name)) name)))
+
+(define-syntax type-out
+  (make-provide-pre-transformer
+   (λ (stx modes)
+     (syntax-parse stx
+       [(_ {~optional {~and #:no-introduce no-introduce?}} provide-spec ...)
+        (pre-expand-export
+         #`(filtered-out mangle-type-name
+                         #,((if (attribute no-introduce?) values type-namespace-introduce)
+                            #'(combine-out provide-spec ...)))
+         modes)]))))
+
+(define-syntax only-types-in
+  (make-require-transformer
+   (syntax-parser
+     [(_ require-spec ...)
+      (expand-import
+       #`(filtered-in (λ (name) (and (regexp-match? mangled-type-regexp name) name))
+                      (combine-in require-spec ...)))])))
+
+(define-syntax unmangle-types-in
+  (make-require-transformer
+   (syntax-parser
+     [(_ {~optional {~and #:no-introduce no-introduce?}} require-spec ...)
+      #:do [(define-values [imports sources] (expand-import #'(combine-in require-spec ...)))]
+      (values (map (match-lambda
+                     [(and i (import local-id src-sym src-mod-path mode req-mode orig-mode orig-stx))
+                      (let* ([local-name (symbol->string (syntax-e local-id))]
+                             [unmangled-type-name (unmangle-type-name local-name)])
+                        (if unmangled-type-name
+                            (let ([unmangled-id (datum->syntax local-id
+                                                               (string->symbol unmangled-type-name)
+                                                               local-id
+                                                               local-id)])
+                              (import (if (attribute no-introduce?) unmangled-id
+                                          (type-namespace-introduce unmangled-id))
+                                      src-sym src-mod-path mode req-mode orig-mode orig-stx))
+                            i))])
+                   imports)
+              sources)])))
+
+;; ---------------------------------------------------------------------------------------------------
+
 (define-syntax-parser @%datum
   [(_ . n:exact-integer)
    (attach-type #'(#%datum . n) (parse-type #'Integer))]
@@ -344,7 +477,7 @@
    (raise-syntax-error #f "literal not supported" #'x)])
 
 (define-syntax-parser :
-  [(_ e t-expr:type)
+  [(_ e {~var t-expr (type #:introduce? #t)})
    (attach-type #`(let-values- ([() (begin- (λ- () t-expr.expansion) (values-))])
                     #,(τ⇐! #'e (attribute t-expr.τ)))
                 (apply-current-subst (attribute t-expr.τ)))])
@@ -381,7 +514,7 @@
 (define-syntax-parser def
   #:literals [:]
   [(_ id:id
-      {~or {~once {~seq : t:type}}
+      {~or {~once {~seq : {~var t (type #:introduce? #t)}}}
            {~optional fixity:fixity-annotation}}
       ...
       e:expr)

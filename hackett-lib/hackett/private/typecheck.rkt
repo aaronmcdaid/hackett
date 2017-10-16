@@ -54,11 +54,12 @@
          ctx-find-solution current-ctx-solution apply-subst apply-current-subst
          current-type-context modify-type-context
          register-global-class-instance! lookup-instance!
+         value-namespace-introduce type-namespace-introduce ~type
          type type-transforming? parse-type τ-stx-token local-expand-type
          make-type-variable-transformer attach-type attach-expected get-type get-expected
          make-typed-var-transformer
 
-         (for-template local-class-instances))
+         (for-template local-class-instances current-value-introducer current-type-introducer))
 
 ;; ---------------------------------------------------------------------------------------------------
 ;; type representation
@@ -524,14 +525,43 @@
 ; represents the resulting type. When types are being expanded, (type-transforming?) will be #t, which
 ; Hackett uses to invoke a custom #%app that converts application expressions to uses of τ:app.
 
+(module namespaces-stxparams racket/base
+  (require (for-syntax racket/base) racket/stxparam)
+  (provide current-value-introducer current-type-introducer)
+  (define-syntax-parameter current-value-introducer #f)
+  (define-syntax-parameter current-type-introducer #f))
+(require (for-template 'namespaces-stxparams))
+
+(define (value-namespace-introduce stx)
+  (unless (and (syntax-parameter-value #'current-value-introducer)
+               (syntax-parameter-value #'current-type-introducer))
+    (error 'value-namespace-introduce "not currently transforming a module with namespaces"))
+  (~> stx
+      ((syntax-parameter-value #'current-value-introducer) 'add)
+      ((syntax-parameter-value #'current-type-introducer) 'remove)))
+
+(define (type-namespace-introduce stx)
+  (unless (and (syntax-parameter-value #'current-value-introducer)
+               (syntax-parameter-value #'current-type-introducer))
+    (error 'value-namespace-introduce "not currently transforming a module with namespaces"))
+  (~> stx
+      ((syntax-parameter-value #'current-value-introducer) 'remove)
+      ((syntax-parameter-value #'current-type-introducer) 'add)))
+
+(define-syntax ~type
+  (pattern-expander
+   (syntax-parser
+     [(_ pat)
+      #'{~and tmp {~parse pat (type-namespace-introduce #'tmp)}}])))
+
 (define type-transforming?-param (make-parameter #f))
 (define (type-transforming?) (type-transforming?-param))
 
-(define-syntax-class (type [intdef-ctx #f])
+(define-syntax-class (type [intdef-ctx #f] #:introduce? [introduce? #f])
   #:attributes [τ expansion]
   #:opaque
   [pattern t:expr
-           #:with expansion (local-expand-type #'t intdef-ctx)
+           #:with expansion (local-expand-type #'t intdef-ctx #:introduce? introduce?)
            #:attr τ (syntax-property (attribute expansion) 'τ)
            #:when (τ? (attribute τ))])
 
@@ -540,10 +570,11 @@
     #:context 'parse-type
     [t:type (attribute t.τ)]))
 
-(define/contract (local-expand-type stx [intdef-ctx #f])
-  (->* [syntax?] [(or/c internal-definition-context? #f)] syntax?)
+(define/contract (local-expand-type stx [intdef-ctx #f] #:introduce? [introduce? #f])
+  (->* [syntax?] [(or/c internal-definition-context? #f) #:introduce? any/c] syntax?)
   (parameterize ([type-transforming?-param #t])
-    (local-expand stx 'expression '() intdef-ctx)))
+    (local-expand (if introduce? (type-namespace-introduce stx) stx)
+                  'expression '() intdef-ctx)))
 
 (define/contract (make-type-variable-transformer t)
   (-> τ? any)
